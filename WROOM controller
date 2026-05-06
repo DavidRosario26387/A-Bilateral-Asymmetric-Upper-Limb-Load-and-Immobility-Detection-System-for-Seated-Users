@@ -1,0 +1,255 @@
+// =======================================
+// ESP32-WROOM Seat Controller
+// Robust Connection + Bucket Demo
+// =======================================
+
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEClient.h>
+
+#define SERVICE_UUID        "12345678-1234-1234-1234-1234567890ab"
+#define CHARACTERISTIC_UUID "abcd1234-5678-1234-5678-abcdef123456"
+
+#define FSR_L1 34
+#define FSR_L2 35
+#define FSR_R1 32
+#define FSR_R2 33
+
+#define VIB_L 25
+#define VIB_R 26
+
+#define LOOP_INTERVAL 200
+#define BLE_TIMEOUT 5000
+
+#define PRESSURE_THRESHOLD 0.2
+#define MOTION_STATIC_THRESHOLD 2.0
+#define MIN_TOTAL_PRESSURE 50
+
+#define BUCKET_MAX 60.0
+#define TRIGGER_LEVEL 60.0
+
+#define BASE_LEAK_RATE 1.0
+#define PRESSURE_WEIGHT 2.0
+#define STATIC_WEIGHT 3.0
+#define MOVEMENT_LEAK_BOOST 2.0
+
+float motion_L = 0;
+float motion_R = 0;
+
+float bucket_L = 0;
+float bucket_R = 0;
+
+unsigned long lastPacket_L = 0;
+unsigned long lastPacket_R = 0;
+unsigned long lastLoopTime = 0;
+
+BLEClient* client_L = nullptr;
+BLEClient* client_R = nullptr;
+BLERemoteCharacteristic* char_L = nullptr;
+BLERemoteCharacteristic* char_R = nullptr;
+
+bool connected_L = false;
+bool connected_R = false;
+
+// ================= BLE CALLBACKS =================
+
+void notifyCallback_L(
+  BLERemoteCharacteristic*,
+  uint8_t* data,
+  size_t length,
+  bool) {
+
+  if (length == 4) {
+    memcpy(&motion_L, data, 4);
+    lastPacket_L = millis();
+  }
+}
+
+void notifyCallback_R(
+  BLERemoteCharacteristic*,
+  uint8_t* data,
+  size_t length,
+  bool) {
+
+  if (length == 4) {
+    memcpy(&motion_R, data, 4);
+    lastPacket_R = millis();
+  }
+}
+
+// ================= CONNECTION =================
+
+bool connectSingle(const char* name,
+                   BLEClient*& client,
+                   BLERemoteCharacteristic*& characteristic,
+                   notify_callback cb) {
+
+  Serial.print("Scanning for ");
+  Serial.println(name);
+
+  BLEScan* scan = BLEDevice::getScan();
+  scan->setActiveScan(true);
+  BLEScanResults* results = scan->start(3);
+
+  for (int i = 0; i < results->getCount(); i++) {
+    BLEAdvertisedDevice dev = results->getDevice(i);
+
+    if (dev.getName() == name) {
+
+      Serial.print("Found ");
+      Serial.println(name);
+
+      client = BLEDevice::createClient();
+
+      if (!client->connect(&dev)) {
+        Serial.println("Connection failed");
+        return false;
+      }
+
+      Serial.println("Connected");
+
+      BLERemoteService* service = client->getService(SERVICE_UUID);
+      if (!service) {
+        Serial.println("Service not found");
+        return false;
+      }
+
+      characteristic = service->getCharacteristic(CHARACTERISTIC_UUID);
+      if (!characteristic) {
+        Serial.println("Characteristic not found");
+        return false;
+      }
+
+      if (characteristic->canNotify()) {
+        characteristic->registerForNotify(cb);
+        Serial.println("Notifications enabled");
+      }
+
+      scan->clearResults();
+      return true;
+    }
+  }
+
+  scan->clearResults();
+  Serial.println("Device not found");
+  return false;
+}
+
+// ================= HELPERS =================
+
+float readPressureLeft() {
+  return analogRead(FSR_L1) + analogRead(FSR_L2);
+}
+
+float readPressureRight() {
+  return analogRead(FSR_R1) + analogRead(FSR_R2);
+}
+
+void vibrate(int pin) {
+  digitalWrite(pin, HIGH);
+  delay(300);
+  digitalWrite(pin, LOW);
+}
+
+float computeRisk(float pressureBias, float motion) {
+
+  float pressureFactor = max(0.0, pressureBias - PRESSURE_THRESHOLD);
+  pressureFactor = constrain(pressureFactor / 0.5, 0, 1);
+
+  float staticFactor = (motion < MOTION_STATIC_THRESHOLD) ? 1.0 :
+                       constrain(MOTION_STATIC_THRESHOLD / motion, 0, 1);
+
+  return (pressureFactor * PRESSURE_WEIGHT) +
+         (staticFactor * STATIC_WEIGHT);
+}
+
+// ================= SETUP =================
+
+void setup() {
+
+  Serial.begin(115200);
+  pinMode(VIB_L, OUTPUT);
+  pinMode(VIB_R, OUTPUT);
+
+  BLEDevice::init("");
+
+  // Keep trying until both connect
+  while (!connected_L || !connected_R) {
+
+    if (!connected_L)
+      connected_L = connectSingle("SHOULDER_L", client_L, char_L, notifyCallback_L);
+
+    if (!connected_R)
+      connected_R = connectSingle("SHOULDER_R", client_R, char_R, notifyCallback_R);
+
+    if (!connected_L || !connected_R) {
+      Serial.println("Retrying in 2 seconds...");
+      delay(2000);
+    }
+  }
+
+  Serial.println("Both wearables connected. Starting logic.");
+  lastLoopTime = millis();
+}
+
+// ================= LOOP =================
+
+void loop() {
+
+  if (millis() - lastLoopTime < LOOP_INTERVAL)
+    return;
+
+  unsigned long now = millis();
+  float dt = (now - lastLoopTime) / 1000.0;
+  lastLoopTime = now;
+
+  if (now - lastPacket_L > BLE_TIMEOUT) motion_L = 0;
+  if (now - lastPacket_R > BLE_TIMEOUT) motion_R = 0;
+
+  float P_L = readPressureLeft();
+  float P_R = readPressureRight();
+  float total = P_L + P_R;
+
+  float PressureBias = 0;
+  if (total > MIN_TOTAL_PRESSURE)
+    PressureBias = (P_L - P_R) / total;
+
+  bool sitting = (total > MIN_TOTAL_PRESSURE);
+
+  float leftRisk = (sitting && PressureBias > 0)
+                   ? computeRisk(PressureBias, motion_L)
+                   : 0;
+
+  float leftLeak = BASE_LEAK_RATE;
+  if (motion_L > MOTION_STATIC_THRESHOLD * 1.5)
+    leftLeak += MOVEMENT_LEAK_BOOST;
+
+  bucket_L += (leftRisk - leftLeak) * dt;
+  bucket_L = constrain(bucket_L, 0, BUCKET_MAX);
+
+  if (bucket_L >= TRIGGER_LEVEL) {
+    Serial.println("LEFT TRIGGER");
+    vibrate(VIB_L);
+    bucket_L = BUCKET_MAX * 0.5;
+  }
+
+  float rightRisk = (sitting && PressureBias < 0)
+                    ? computeRisk(-PressureBias, motion_R)
+                    : 0;
+
+  float rightLeak = BASE_LEAK_RATE;
+  if (motion_R > MOTION_STATIC_THRESHOLD * 1.5)
+    rightLeak += MOVEMENT_LEAK_BOOST;
+
+  bucket_R += (rightRisk - rightLeak) * dt;
+  bucket_R = constrain(bucket_R, 0, BUCKET_MAX);
+
+  if (bucket_R >= TRIGGER_LEVEL) {
+    Serial.println("RIGHT TRIGGER");
+    vibrate(VIB_R);
+    bucket_R = BUCKET_MAX * 0.5;
+  }
+
+  Serial.printf("Bias:%6.3f | L:%5.2f | R:%5.2f | BL:%5.1f | BR:%5.1f\n",
+                PressureBias, motion_L, motion_R, bucket_L, bucket_R);
+}
