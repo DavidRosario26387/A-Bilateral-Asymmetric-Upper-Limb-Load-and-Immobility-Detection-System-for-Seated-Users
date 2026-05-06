@@ -1,0 +1,227 @@
+// =======================================
+// ESP32-C3 Wearable Node (Calibrated Fast)
+// =======================================
+
+#include <Wire.h>
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEServer.h>
+#include <BLE2902.h>
+
+#define DEVICE_NAME "SHOULDER_L"   // CHANGE FOR RIGHT
+#define SERVICE_UUID        "12345678-1234-1234-1234-1234567890ab"
+#define CHARACTERISTIC_UUID "abcd1234-5678-1234-5678-abcdef123456"
+
+#define MPU_ADDR 0x68
+
+#define I2C_SDA 8
+#define I2C_SCL 9
+
+#define LED_RED   5
+#define LED_GREEN 6
+
+#define SAMPLE_INTERVAL 20
+#define BLE_INTERVAL 2000
+#define MOTION_CHECK_INTERVAL 100
+
+#define STATIC_THRESHOLD 10
+
+BLECharacteristic *pCharacteristic;
+
+float motionSmooth = 0;
+
+float biasX = 0;
+float biasY = 0;
+float biasZ = 0;
+
+unsigned long lastSample = 0;
+unsigned long lastBLESend = 0;
+unsigned long lastMotionCheck = 0;
+unsigned long lastLEDUpdate = 0;
+
+bool isStatic = false;
+unsigned long staticStartTime = 0;
+
+// ----------------------------------------
+
+void setupMPU() {
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x6B);
+  Wire.write(0);
+  Wire.endTransmission(true);
+}
+
+// ----------------------------------------
+// CALIBRATION (IMPORTANT)
+
+void calibrateGyro() {
+
+  Serial.println("Calibrating gyro... Keep still.");
+
+  const int samples = 200;
+  float sumX = 0, sumY = 0, sumZ = 0;
+
+  for (int i = 0; i < samples; i++) {
+
+    Wire.beginTransmission(MPU_ADDR);
+    Wire.write(0x43);
+    Wire.endTransmission(false);
+    Wire.requestFrom(MPU_ADDR, 6, true);
+
+    int16_t gx = Wire.read() << 8 | Wire.read();
+    int16_t gy = Wire.read() << 8 | Wire.read();
+    int16_t gz = Wire.read() << 8 | Wire.read();
+
+    sumX += gx;
+    sumY += gy;
+    sumZ += gz;
+
+    delay(5);
+  }
+
+  biasX = (sumX / samples) / 131.0;
+  biasY = (sumY / samples) / 131.0;
+  biasZ = (sumZ / samples) / 131.0;
+
+  Serial.println("Calibration done.");
+}
+
+// ----------------------------------------
+
+float readGyroMagnitude() {
+
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x43);
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU_ADDR, 6, true);
+
+  if (Wire.available() < 6) return 0;
+
+  int16_t gx = Wire.read() << 8 | Wire.read();
+  int16_t gy = Wire.read() << 8 | Wire.read();
+  int16_t gz = Wire.read() << 8 | Wire.read();
+
+  float gxf = gx / 131.0 - biasX;
+  float gyf = gy / 131.0 - biasY;
+  float gzf = gz / 131.0 - biasZ;
+
+  float mag = sqrt(gxf*gxf + gyf*gyf + gzf*gzf);
+
+  return mag;
+}
+
+// ----------------------------------------
+
+void updateLEDs() {
+
+  if (isStatic) {
+    digitalWrite(LED_RED, HIGH);
+    digitalWrite(LED_GREEN, LOW);
+  } else {
+    digitalWrite(LED_RED, LOW);
+
+    if (millis() - lastLEDUpdate >= 500) {
+      lastLEDUpdate = millis();
+      digitalWrite(LED_GREEN, !digitalRead(LED_GREEN));
+    }
+  }
+}
+
+// ----------------------------------------
+
+void setupBLE() {
+
+  BLEDevice::init(DEVICE_NAME);
+  BLEServer *server = BLEDevice::createServer();
+  BLEService *service = server->createService(SERVICE_UUID);
+
+  pCharacteristic = service->createCharacteristic(
+                      CHARACTERISTIC_UUID,
+                      BLECharacteristic::PROPERTY_NOTIFY
+                    );
+
+  pCharacteristic->addDescriptor(new BLE2902());
+  service->start();
+
+  BLEAdvertising *advertising = BLEDevice::getAdvertising();
+  advertising->addServiceUUID(SERVICE_UUID);
+  advertising->start();
+}
+
+// ----------------------------------------
+
+void setup() {
+
+  Serial.begin(115200);
+
+  pinMode(LED_RED, OUTPUT);
+  pinMode(LED_GREEN, OUTPUT);
+
+  digitalWrite(LED_RED, LOW);
+  digitalWrite(LED_GREEN, LOW);
+
+  setupMPU();
+  delay(1000);
+  calibrateGyro();   // IMPORTANT
+
+  setupBLE();
+}
+
+// ----------------------------------------
+
+void loop() {
+
+  unsigned long now = millis();
+
+  if (now - lastSample >= SAMPLE_INTERVAL) {
+    lastSample = now;
+
+    float mag = readGyroMagnitude();
+
+    // Fast smoothing
+    motionSmooth = 0.7 * mag + 0.3 * motionSmooth;
+
+    // Force rapid decay
+    if (mag < 0.2)
+      motionSmooth *= 0.5;
+
+    if (motionSmooth < 0.1)
+      motionSmooth = 0;
+  }
+
+  if (now - lastMotionCheck >= MOTION_CHECK_INTERVAL) {
+
+    lastMotionCheck = now;
+
+    if (motionSmooth < STATIC_THRESHOLD) {
+
+      if (!isStatic) {
+        if (staticStartTime == 0)
+          staticStartTime = now;
+
+        if (now - staticStartTime >= 3000)
+          isStatic = true;
+      }
+
+    } else {
+      staticStartTime = 0;
+      isStatic = false;
+    }
+
+    Serial.print("MotionIndex: ");
+    Serial.println(motionSmooth);
+  }
+
+  updateLEDs();
+
+  if (now - lastBLESend >= BLE_INTERVAL) {
+
+    lastBLESend = now;
+
+    uint8_t payload[4];
+    memcpy(payload, &motionSmooth, 4);
+    pCharacteristic->setValue(payload, 4);
+    pCharacteristic->notify();
+  }
+}
